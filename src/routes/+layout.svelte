@@ -1,9 +1,11 @@
 <script lang="ts">
 	import favicon from '$lib/assets/favicon.svg';
     import '../app.css';
-	import { PUBLIC_GOOGLE_MAPS_API_KEY } from '$env/static/public';
+	import { env } from '$env/dynamic/public';
 
 	let { children } = $props();
+
+	const { PUBLIC_GOOGLE_MAPS_API_KEY } = env
 
 	console.log('env =', PUBLIC_GOOGLE_MAPS_API_KEY)
 </script>
