@@ -3,7 +3,23 @@
 </script>
 
 <script lang="ts">
-    import { onMount } from 'svelte';
+    import { onMount, onDestroy } from 'svelte';
+    import { user } from '$lib/stores/auth';
+    import Auth from '$lib/components/Auth.svelte';
+    import {
+        getCategoriesWithSpots,
+        createCategory as createCategoryInDb,
+        updateCategory as updateCategoryInDb,
+        deleteCategory as deleteCategoryInDb,
+        createSpot as createSpotInDb,
+        updateSpot as updateSpotInDb,
+        deleteSpot as deleteSpotInDb,
+        subscribeToCategories,
+        subscribeToSpots,
+        unsubscribeAll,
+        type Category as DbCategory,
+        type Spot as DbSpot
+    } from '$lib/supabase';
     
     // Define interfaces for our data structures
     interface Spot {
@@ -13,6 +29,7 @@
         lat: number;
         lng: number;
         placeId: string;
+        display_order?: number;
     }
 
     interface Category {
@@ -20,6 +37,7 @@
         name: string;
         spots: Spot[];
         expanded?: boolean;
+        display_order?: number;
     }
 
     // Google Maps and App State
@@ -30,6 +48,169 @@
     let categories: Category[] = [];
     let currentSelectedPlace: any = null;
     let showPOIs = true; // Show Points of Interest by default
+    let isAuthenticated = false;
+    let dataLoading = false;
+    let unsubscribeCategories: (() => void) | null = null;
+    let unsubscribeSpots: (() => void) | null = null;
+
+    // Subscribe to user changes
+    user.subscribe(async (u) => {
+        isAuthenticated = !!u;
+        if (u) {
+            // User logged in - load data from Supabase and start real-time
+            await loadDataFromSupabase();
+            setupRealtimeSubscriptions();
+        } else {
+            // User logged out - cleanup real-time and load from localStorage
+            cleanupRealtimeSubscriptions();
+            loadDataFromLocalStorage();
+        }
+    });
+
+    // Setup real-time subscriptions
+    function setupRealtimeSubscriptions() {
+        // Subscribe to category changes
+        unsubscribeCategories = subscribeToCategories((payload) => {
+            console.log('📡 Category change:', payload.eventType, payload);
+            handleCategoryRealtimeUpdate({
+                eventType: payload.eventType,
+                new: payload.new as DbCategory | null,
+                old: payload.old as DbCategory | null
+            });
+        });
+
+        // Subscribe to spot changes
+        unsubscribeSpots = subscribeToSpots((payload) => {
+            console.log('📡 Spot change:', payload.eventType, payload);
+            handleSpotRealtimeUpdate({
+                eventType: payload.eventType,
+                new: payload.new as DbSpot | null,
+                old: payload.old as DbSpot | null
+            });
+        });
+    }
+
+    // Handle real-time category updates
+    function handleCategoryRealtimeUpdate(payload: {
+        eventType: 'INSERT' | 'UPDATE' | 'DELETE';
+        new: DbCategory | null;
+        old: DbCategory | null;
+    }) {
+        switch (payload.eventType) {
+            case 'INSERT':
+                if (payload.new && !categories.find(c => c.id === payload.new!.id)) {
+                    categories = [...categories, {
+                        id: payload.new.id,
+                        name: payload.new.name,
+                        spots: [],
+                        expanded: payload.new.expanded,
+                        display_order: payload.new.display_order
+                    }].sort((a, b) => (a.display_order || 0) - (b.display_order || 0));
+                    renderCategories();
+                }
+                break;
+            case 'UPDATE':
+                if (payload.new) {
+                    const index = categories.findIndex(c => c.id === payload.new!.id);
+                    if (index !== -1) {
+                        categories[index] = {
+                            ...categories[index],
+                            name: payload.new.name,
+                            expanded: payload.new.expanded,
+                            display_order: payload.new.display_order
+                        };
+                        categories = [...categories].sort((a, b) => (a.display_order || 0) - (b.display_order || 0));
+                        renderCategories();
+                    }
+                }
+                break;
+            case 'DELETE':
+                if (payload.old) {
+                    categories = categories.filter(c => c.id !== payload.old!.id);
+                    renderCategories();
+                    updateMarkers();
+                }
+                break;
+        }
+    }
+
+    // Handle real-time spot updates
+    function handleSpotRealtimeUpdate(payload: {
+        eventType: 'INSERT' | 'UPDATE' | 'DELETE';
+        new: DbSpot | null;
+        old: DbSpot | null;
+    }) {
+        switch (payload.eventType) {
+            case 'INSERT':
+                if (payload.new) {
+                    const category = categories.find(c => c.id === payload.new!.category_id);
+                    if (category && !category.spots.find(s => s.id === payload.new!.id)) {
+                        category.spots = [...category.spots, {
+                            id: payload.new.id,
+                            name: payload.new.name,
+                            address: payload.new.address || '',
+                            lat: payload.new.lat,
+                            lng: payload.new.lng,
+                            placeId: payload.new.place_id || '',
+                            display_order: payload.new.display_order
+                        }].sort((a, b) => (a.display_order || 0) - (b.display_order || 0));
+                        categories = [...categories];
+                        renderCategories();
+                        updateMarkers();
+                    }
+                }
+                break;
+            case 'UPDATE':
+                if (payload.new) {
+                    const category = categories.find(c => c.id === payload.new!.category_id);
+                    if (category) {
+                        const spotIndex = category.spots.findIndex(s => s.id === payload.new!.id);
+                        if (spotIndex !== -1) {
+                            category.spots[spotIndex] = {
+                                ...category.spots[spotIndex],
+                                name: payload.new.name,
+                                address: payload.new.address || '',
+                                display_order: payload.new.display_order
+                            };
+                            category.spots = [...category.spots].sort((a, b) => (a.display_order || 0) - (b.display_order || 0));
+                            categories = [...categories];
+                            renderCategories();
+                            updateMarkers();
+                        }
+                    }
+                }
+                break;
+            case 'DELETE':
+                if (payload.old) {
+                    const category = categories.find(c => c.id === payload.old!.category_id);
+                    if (category) {
+                        category.spots = category.spots.filter(s => s.id !== payload.old!.id);
+                        categories = [...categories];
+                        renderCategories();
+                        updateMarkers();
+                    }
+                }
+                break;
+        }
+    }
+
+    // Cleanup real-time subscriptions
+    function cleanupRealtimeSubscriptions() {
+        if (unsubscribeCategories) {
+            unsubscribeCategories();
+            unsubscribeCategories = null;
+        }
+        if (unsubscribeSpots) {
+            unsubscribeSpots();
+            unsubscribeSpots = null;
+        }
+        unsubscribeAll();
+    }
+
+    // Cleanup on component destroy
+    onDestroy(() => {
+        cleanupRealtimeSubscriptions();
+    });
 
     onMount(() => {
         // Initialize when page loads (converted from window.addEventListener('DOMContentLoaded'))
@@ -42,17 +223,6 @@
         
         // Setup basic event listeners first (these work even without map)
         setupBasicEventListeners();
-        
-        // Load and render categories (works without map)
-        const saved = localStorage.getItem('favoriteSpots_categories');
-        if (saved) {
-            try {
-                categories = JSON.parse(saved);
-                renderCategories();
-            } catch (e) {
-                console.error('Error loading data:', e);
-            }
-        }
         
         // Check if Google Maps API is loaded
         const checkGoogleMaps = setInterval(() => {
@@ -76,6 +246,57 @@
         w.moveSpotDown = moveSpotDown;
         w.openSpotModal = openSpotModal; // Exposed for InfoWindow
     });
+
+    // Load data from Supabase
+    async function loadDataFromSupabase() {
+        dataLoading = true;
+        try {
+            const { data, error } = await getCategoriesWithSpots();
+            if (error) {
+                console.error('Error loading from Supabase:', error);
+                loadDataFromLocalStorage();
+                return;
+            }
+            if (data) {
+                // Transform data to match local format
+                categories = data.map(cat => ({
+                    id: cat.id,
+                    name: cat.name,
+                    expanded: cat.expanded,
+                    display_order: cat.display_order,
+                    spots: cat.spots.map((spot: any) => ({
+                        id: spot.id,
+                        name: spot.name,
+                        address: spot.address || '',
+                        lat: spot.lat,
+                        lng: spot.lng,
+                        placeId: spot.place_id || '',
+                        display_order: spot.display_order
+                    }))
+                }));
+                renderCategories();
+                updateMarkers();
+            }
+        } catch (e) {
+            console.error('Error loading from Supabase:', e);
+            loadDataFromLocalStorage();
+        }
+        dataLoading = false;
+    }
+
+    // Load data from localStorage (fallback for non-authenticated users)
+    function loadDataFromLocalStorage() {
+        const saved = localStorage.getItem('favoriteSpots_categories');
+        if (saved) {
+            try {
+                categories = JSON.parse(saved);
+                renderCategories();
+                updateMarkers();
+            } catch (e) {
+                console.error('Error loading data:', e);
+            }
+        }
+    }
 
     // Setup basic event listeners that don't depend on map
     function setupBasicEventListeners() {
@@ -821,7 +1042,7 @@
         if (input) input.value = '';
     }
 
-    function createCategory() {
+    async function createCategory() {
         const input = document.getElementById('category-name-input') as HTMLInputElement;
         const name = input ? input.value.trim() : '';
         if (!name) {
@@ -835,20 +1056,50 @@
             return;
         }
 
-        const category: Category = {
-            id: Date.now().toString(),
-            name: name,
-            spots: []
-        };
-
-        categories.push(category);
-        saveData();
-        renderCategories();
+        if (isAuthenticated) {
+            // Save to Supabase
+            const { data, error } = await createCategoryInDb(name, categories.length);
+            if (error) {
+                console.error('Error creating category:', error);
+                alert('Failed to create category. Please try again.');
+                return;
+            }
+            if (data) {
+                const category: Category = {
+                    id: data.id,
+                    name: data.name,
+                    spots: [],
+                    expanded: false,
+                    display_order: data.display_order
+                };
+                categories.push(category);
+                renderCategories();
+            }
+        } else {
+            // Save to localStorage
+            const category: Category = {
+                id: Date.now().toString(),
+                name: name,
+                spots: []
+            };
+            categories.push(category);
+            saveData();
+            renderCategories();
+        }
+        
         closeCategoryModal();
     }
 
-    function deleteCategory(categoryId: string) {
+    async function deleteCategory(categoryId: string) {
         if (confirm('Are you sure you want to delete this category? All spots in it will be removed.')) {
+            if (isAuthenticated) {
+                const { error } = await deleteCategoryInDb(categoryId);
+                if (error) {
+                    console.error('Error deleting category:', error);
+                    alert('Failed to delete category. Please try again.');
+                    return;
+                }
+            }
             categories = categories.filter(cat => cat.id !== categoryId);
             saveData();
             renderCategories();
@@ -857,20 +1108,34 @@
         }
     }
 
-    function moveCategoryUp(categoryId: string) {
+    async function moveCategoryUp(categoryId: string) {
         const index = categories.findIndex(cat => cat.id === categoryId);
         if (index > 0) {
             [categories[index - 1], categories[index]] = [categories[index], categories[index - 1]];
+            
+            if (isAuthenticated) {
+                // Update display_order in Supabase
+                await updateCategoryInDb(categories[index].id, { display_order: index });
+                await updateCategoryInDb(categories[index - 1].id, { display_order: index - 1 });
+            }
+            
             saveData();
             renderCategories();
             showSuccessMessage('Category moved up!');
         }
     }
 
-    function moveCategoryDown(categoryId: string) {
+    async function moveCategoryDown(categoryId: string) {
         const index = categories.findIndex(cat => cat.id === categoryId);
         if (index < categories.length - 1) {
             [categories[index], categories[index + 1]] = [categories[index + 1], categories[index]];
+            
+            if (isAuthenticated) {
+                // Update display_order in Supabase
+                await updateCategoryInDb(categories[index].id, { display_order: index });
+                await updateCategoryInDb(categories[index + 1].id, { display_order: index + 1 });
+            }
+            
             saveData();
             renderCategories();
             showSuccessMessage('Category moved down!');
@@ -911,7 +1176,7 @@
         // Don't hide the floating button when closing modal, keep it visible
     }
 
-    function saveSpotToCategory() {
+    async function saveSpotToCategory() {
         try {
             if (!currentSelectedPlace) {
                 alert('Please select a place first');
@@ -946,17 +1211,48 @@
                 return;
             }
 
-            // Add spot to category
-            category.spots.push({
-                id: Date.now().toString(),
-                name: currentSelectedPlace.name,
-                address: currentSelectedPlace.address,
-                lat: currentSelectedPlace.lat,
-                lng: currentSelectedPlace.lng,
-                placeId: currentSelectedPlace.placeId
-            });
+            if (isAuthenticated) {
+                // Save to Supabase
+                const { data, error } = await createSpotInDb({
+                    category_id: categoryId,
+                    name: currentSelectedPlace.name,
+                    address: currentSelectedPlace.address,
+                    lat: currentSelectedPlace.lat,
+                    lng: currentSelectedPlace.lng,
+                    place_id: currentSelectedPlace.placeId,
+                    display_order: category.spots.length
+                });
 
-            saveData();
+                if (error) {
+                    console.error('Error saving spot:', error);
+                    alert('Failed to save spot. Please try again.');
+                    return;
+                }
+
+                if (data) {
+                    category.spots.push({
+                        id: data.id,
+                        name: data.name,
+                        address: data.address || '',
+                        lat: data.lat,
+                        lng: data.lng,
+                        placeId: data.place_id || '',
+                        display_order: data.display_order
+                    });
+                }
+            } else {
+                // Save to localStorage
+                category.spots.push({
+                    id: Date.now().toString(),
+                    name: currentSelectedPlace.name,
+                    address: currentSelectedPlace.address,
+                    lat: currentSelectedPlace.lat,
+                    lng: currentSelectedPlace.lng,
+                    placeId: currentSelectedPlace.placeId
+                });
+                saveData();
+            }
+
             renderCategories();
             updateMarkers();
             closeSpotModal();
@@ -972,9 +1268,18 @@
         }
     }
 
-    function deleteSpot(categoryId: string, spotId: string) {
+    async function deleteSpot(categoryId: string, spotId: string) {
         const category = categories.find(cat => cat.id === categoryId);
         if (!category) return;
+
+        if (isAuthenticated) {
+            const { error } = await deleteSpotInDb(spotId);
+            if (error) {
+                console.error('Error deleting spot:', error);
+                alert('Failed to delete spot. Please try again.');
+                return;
+            }
+        }
 
         category.spots = category.spots.filter(spot => spot.id !== spotId);
         saveData();
@@ -982,26 +1287,38 @@
         updateMarkers();
     }
 
-    function moveSpotUp(categoryId: string, spotId: string) {
+    async function moveSpotUp(categoryId: string, spotId: string) {
         const category = categories.find(cat => cat.id === categoryId);
         if (!category) return;
 
         const index = category.spots.findIndex(spot => spot.id === spotId);
         if (index > 0) {
             [category.spots[index - 1], category.spots[index]] = [category.spots[index], category.spots[index - 1]];
+            
+            if (isAuthenticated) {
+                await updateSpotInDb(category.spots[index].id, { display_order: index });
+                await updateSpotInDb(category.spots[index - 1].id, { display_order: index - 1 });
+            }
+            
             saveData();
             renderCategories();
             showSuccessMessage('Spot moved up!');
         }
     }
 
-    function moveSpotDown(categoryId: string, spotId: string) {
+    async function moveSpotDown(categoryId: string, spotId: string) {
         const category = categories.find(cat => cat.id === categoryId);
         if (!category) return;
 
         const index = category.spots.findIndex(spot => spot.id === spotId);
         if (index < category.spots.length - 1) {
             [category.spots[index], category.spots[index + 1]] = [category.spots[index + 1], category.spots[index]];
+            
+            if (isAuthenticated) {
+                await updateSpotInDb(category.spots[index].id, { display_order: index });
+                await updateSpotInDb(category.spots[index + 1].id, { display_order: index + 1 });
+            }
+            
             saveData();
             renderCategories();
             showSuccessMessage('Spot moved down!');
@@ -1037,10 +1354,15 @@
         input.select();
 
         // Save on Enter
-        const saveEdit = () => {
+        const saveEdit = async () => {
             const newName = input.value.trim();
             if (newName && newName !== spot.name) {
                 spot.name = newName;
+                
+                if (isAuthenticated) {
+                    await updateSpotInDb(spotId, { name: newName });
+                }
+                
                 saveData();
                 renderCategories();
                 updateMarkers();
@@ -1143,7 +1465,7 @@
         setupDragAndDrop();
     }
 
-    function toggleCategory(categoryId: string) {
+    async function toggleCategory(categoryId: string) {
         const categoryElement = document.querySelector(`[data-category-id="${categoryId}"]`);
         const category = categories.find(cat => cat.id === categoryId);
         
@@ -1151,6 +1473,11 @@
             categoryElement.classList.toggle('expanded');
             if (category) {
                 category.expanded = categoryElement.classList.contains('expanded');
+                
+                if (isAuthenticated) {
+                    await updateCategoryInDb(categoryId, { expanded: category.expanded });
+                }
+                
                 saveData();
             }
         }
@@ -2101,6 +2428,9 @@
             </div>
             <!-- Autocomplete Dropdown -->
             <div id="autocomplete-dropdown" class="autocomplete-dropdown"></div>
+        </div>
+        <div class="auth-wrapper">
+            <Auth />
         </div>
     </header>
 
